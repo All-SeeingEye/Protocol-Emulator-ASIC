@@ -1,0 +1,5 @@
+1. Make the interface uart independent, such that we can add multiple cpus to simulate the exact transmitter and reciever behavious
+2. fix these in ISA: 
+   1. The receiver handles only one frame before halting
+   2. The baud period is hardcoded into the instruction sequence
+   3. The program also cannot report framing errors with the current instruction set.

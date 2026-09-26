@@ -26,7 +26,7 @@
    3. 1 cycle
 8.  WAIT_PIN
    1.  Don't proceed till the register becomes N
-   2.  WAIT_PIN Rx N
+   2.  WAIT_PIN PIN VALUE [MODE] [TIMEOUT]
    3.  INF cycle
 9. DIR 
    1. Configure GPIO as in/out/released

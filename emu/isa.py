@@ -1,9 +1,46 @@
-from cpu import * 
+from cpu import *
+
+# ============================================================
+# Every instruction below is fully responsible for its own
+# PC and cycle update. simulator.execute() only decodes.
+# ============================================================
+
+
+def _int(name: str, value) -> int:
+    # bool is a subclass of int; reject it so (SET, 0, True) is caught.
+    if type(value) is not int:
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    return value
+
+
+def _check_pin(pin) -> int:
+    _int("GPIO pin", pin)
+    if not 0 <= pin < GPIO_COUNT:
+        raise ValueError(f"Invalid GPIO pin: {pin}")
+    return pin
+
+
+def _check_reg(register) -> int:
+    _int("Register", register)
+    if not 0 <= register < REG_COUNT:
+        raise ValueError(f"Invalid register: R{register}")
+    return register
+
+
+def _check_level(value) -> int:
+    _int("GPIO value", value)
+    if value not in (0, 1):
+        raise ValueError(f"GPIO value must be 0 or 1: {value}")
+    return value
+
+
 # ============================================================
 #    SET pin, value
 #
 #    Semantics:
-#        GPIO[pin] <- value
+#        GPIO_OUT[pin] <- value
+#        if DIR[pin] == OUTPUT: GPIO[pin] <- value
+#        (on an INPUT pin only the latch changes: pre-load before DIR)
 #    Timing:
 #        1 cycle
 #
@@ -12,18 +49,17 @@ from cpu import *
 # ============================================================
 
 def set_gpio(cpu: CPU, pin: int, value: int) -> None:
-    if not 0 <= pin < 8:
-        raise ValueError(f"Invalid GPIO pin: {pin}")
+    _check_pin(pin)
+    _check_level(value)
 
-    if value not in (0, 1):
-        raise ValueError(f"GPIO value must be 0 or 1: {value}")
+    # Record only actual latch transitions.
+    if cpu.gpio_out[pin] != value:
+        cpu.gpio_out[pin] = value
+        cpu.waveform.append((cpu.cycle, pin, value))
 
-    # Record only actual transitions.
-    if cpu.gpio[pin] != value:
+    if cpu.gpio_dir[pin] == GPIO_OUTPUT:
         cpu.gpio[pin] = value
-        cpu.waveform.append(
-            (cpu.cycle, pin, value)
-        )
+
     cpu.pc += 1
     cpu.cycle += 1
 
@@ -42,8 +78,8 @@ def set_gpio(cpu: CPU, pin: int, value: int) -> None:
 # ============================================================
 
 def move_data(cpu: CPU, register: int, value: int) -> None:
-    if not 0 <= register < 8:
-        raise ValueError(f"Invalid register: R{register}")
+    _check_reg(register)
+    _int("MOV immediate", value)
 
     cpu.reg[register] = value & REG_MASK
     cpu.pc += 1
@@ -64,10 +100,12 @@ def move_data(cpu: CPU, register: int, value: int) -> None:
 # ============================================================
 
 def cpu_wait(cpu: CPU, cycles: int) -> None:
+    _int("WAIT cycles", cycles)
     if cycles < 0:
         raise ValueError("WAIT value cannot be negative")
 
     cpu.cycle += cycles
+    cpu.pc += 1
 
 # ============================================================
 # JUMP
@@ -75,13 +113,15 @@ def cpu_wait(cpu: CPU, cycles: int) -> None:
 #
 #    Semantics:
 #        PC <- PC + offset
-# 
+#
 #    Timing:
 #        1 cycle
 # ============================================================
 
 def jump_offset(cpu: CPU, offset: int) -> None:
+    _int("JUMP offset", offset)
     cpu.pc += offset
+    cpu.cycle += 1
 
 # ============================================================
 # HALT
@@ -96,13 +136,15 @@ def jump_offset(cpu: CPU, offset: int) -> None:
 
 def cpu_halt(cpu: CPU) -> None:
     cpu.halted = True
+    cpu.cycle += 1
 
 # ============================================================
 # IN
-#    IN REGISTER PIN 
+#    IN DIRECTION REGISTER PIN
 #
 #    Semantics:
-#        REGISTER[index] <- GPIO[index]
+#        R: REG <- (REG >> 1) | (GPIO[pin] << 31)   (LSB-first receive)
+#        L: REG <- (REG << 1) | GPIO[pin]           (MSB-first receive)
 #
 #    Timing:
 #        1 cycle
@@ -118,11 +160,8 @@ def register_in(
     if direction not in ("L", "R"):
         raise ValueError("IN direction must be L or R")
 
-    if not 0 <= register < REG_COUNT:
-        raise ValueError("Invalid register")
-
-    if not 0 <= pin < GPIO_COUNT:
-        raise ValueError("Invalid GPIO pin")
+    _check_reg(register)
+    _check_pin(pin)
 
     bit = cpu.gpio[pin]
 
@@ -143,6 +182,7 @@ def register_in(
         ) & REG_MASK
 
     cpu.pc += 1
+    cpu.cycle += 1
 
 # ============================================================
 # SHIFT
@@ -159,30 +199,40 @@ def shift_reg(cpu: CPU, direction: str, register: int, value: int):
     if direction not in ("R", "L"):
         raise ValueError("Invalid shift direction")
 
-    if not 0 <= register < 8:
-        raise ValueError("Invalid register")
+    _check_reg(register)
+    _int("Shift amount", value)
 
-    if not 0 <= value < 32:
-        raise ValueError("Shift amount must be between 0 and 31")
+    if not 0 <= value < REG_WIDTH:
+        raise ValueError(f"Shift amount must be between 0 and {REG_WIDTH - 1}")
 
     if direction == "R":
         cpu.reg[register] >>= value
 
-    elif direction == "L":
+    else:
         cpu.reg[register] = (
             cpu.reg[register] << value
         ) & REG_MASK
+
     cpu.pc += 1
+    cpu.cycle += 1
 
 # ============================================================
 # WAIT_PIN
-#    WAIT_PIN PIN VALUE
+#    WAIT_PIN PIN VALUE [MODE] [TIMEOUT]
 #
 #    Semantics:
-#        Wait till the GPIO pin == VALUE, waste the cycle till not equal otherwise incremnet the pc 
+#        LEVEL: wait until GPIO[pin] == VALUE
+#        FALL : wait for a 1 -> 0 transition (VALUE must be 0)
+#        RISE : wait for a 0 -> 1 transition (VALUE must be 1)
+#        CHECK: sample once; error if GPIO[pin] != VALUE
+#               (used e.g. for UART stop-bit validation)
+#
+#        Each sample costs one cycle. PC advances when matched.
+#        Edges are detected against the level seen in the previous
+#        cycle, so an edge on the first sampled cycle is caught.
 #
 #    Timing:
-#        1 cycle
+#        1 cycle per sample
 # ============================================================
 
 def wait_pin(
@@ -190,14 +240,11 @@ def wait_pin(
     pin: int,
     value: int,
     mode: str = "LEVEL",
-    timeout: int = None
+    timeout: Optional[int] = None
 ) -> None:
 
-    if not 0 <= pin < GPIO_COUNT:
-        raise ValueError("Invalid GPIO pin")
-
-    if value not in (0, 1):
-        raise ValueError("Invalid GPIO value")
+    _check_pin(pin)
+    _check_level(value)
 
     if mode not in ("LEVEL", "FALL", "RISE", "CHECK"):
         raise ValueError("Invalid WAIT_PIN mode")
@@ -208,8 +255,10 @@ def wait_pin(
     if mode == "RISE" and value != 1:
         raise ValueError("RISE requires value 1")
 
-    if timeout is not None and timeout < 1:
-        raise ValueError("Timeout must be positive")
+    if timeout is not None:
+        _int("Timeout", timeout)
+        if timeout < 1:
+            raise ValueError("Timeout must be positive")
 
     current = cpu.gpio[pin]
 
@@ -234,11 +283,18 @@ def wait_pin(
         cpu.wait_pin_state is None
         or cpu.wait_pin_state["key"] != key
     ):
+        if cpu.gpio_prev is not None:
+            # Engine tracks the previous-cycle level: edge detection is live
+            # from the very first sample, like a hardware edge detector.
+            previous, armed = cpu.gpio_prev[pin], True
+        else:
+            # Standalone use: first sample only arms the detector.
+            previous, armed = current, False
         cpu.wait_pin_state = {
             "key": key,
-            "previous": current,
+            "previous": previous,
             "elapsed": 0,
-            "armed": False,
+            "armed": armed,
         }
 
     state = cpu.wait_pin_state
@@ -267,25 +323,31 @@ def wait_pin(
     if timeout is not None and state["elapsed"] >= timeout:
         cpu.wait_pin_state = None
         raise TimeoutError(f"WAIT_PIN timed out on GPIO{pin}")
-    
+
 # ============================================================
 #    DIR pin, direction
 #
 #    direction:
-#        0 = INPUT
-#        1 = OUTPUT
+#        0 = INPUT   (pin released; level comes from the wire)
+#        1 = OUTPUT  (pin driven from the output latch)
 #
 #    Timing:
 #        1 cycle
+#
+#    PC:
+#        PC <- PC + 1
 # ============================================================
 
 def set_gpio_dir(cpu: CPU, pin: int, direction: int):
-    if not 0 <= pin < 8:
-        raise ValueError("Invalid GPIO pin")
+    _check_pin(pin)
+    _int("Direction", direction)
 
-    if direction not in (0, 1):
+    if direction not in (GPIO_INPUT, GPIO_OUTPUT):
         raise ValueError("Direction must be 0 or 1")
 
     cpu.gpio_dir[pin] = direction
+    if direction == GPIO_OUTPUT:
+        # Pin immediately shows the latched output value.
+        cpu.gpio[pin] = cpu.gpio_out[pin]
+    cpu.pc += 1
     cpu.cycle += 1
-

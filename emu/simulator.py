@@ -1,78 +1,66 @@
 from isa import *
-from cpu import * 
+from cpu import *
+
+# Operand count for each opcode (including the opcode itself).
+SYNTAX = {
+    "SET":      ((3, 3), "('SET', pin, value)"),
+    "MOV":      ((3, 3), "('MOV', register, immediate)"),
+    "WAIT":     ((2, 2), "('WAIT', cycles)"),
+    "JUMP":     ((2, 2), "('JUMP', offset)"),
+    "HALT":     ((1, 1), "('HALT',)"),
+    "IN":       ((4, 4), "('IN', direction, register, pin)"),
+    "SHIFT":    ((4, 4), "('SHIFT', direction, register, amount)"),
+    "WAIT_PIN": ((3, 5), "('WAIT_PIN', pin, value, mode?, timeout?)"),
+    "DIR":      ((3, 3), "('DIR', pin, direction)"),
+}
+
+
+def check_syntax(instruction: tuple) -> None:
+    opcode = instruction[0]
+    if opcode not in SYNTAX:
+        raise ValueError(f"Unknown opcode: {opcode}")
+    (lo, hi), usage = SYNTAX[opcode]
+    if not lo <= len(instruction) <= hi:
+        raise ValueError(f"{opcode} syntax: {usage}")
+
 
 def execute(cpu: CPU, instruction: tuple) -> None:
-
+    """Decode one instruction. Each ISA function updates PC and cycle itself."""
+    check_syntax(instruction)
     opcode = instruction[0]
-    if opcode == "SET":
-        if len(instruction) != 3:
-            raise ValueError("SET syntax: ('SET', pin, value)")
-        pin = instruction[1]
-        value = instruction[2]
-        set_gpio(cpu, pin, value)
-    elif opcode == "MOV":
-        if len(instruction) != 3:
-            raise ValueError("MOV syntax: ('MOV', register, immediate)")
-        register = instruction[1]
-        value = instruction[2]
-        move_data(cpu, register, value)
-    elif opcode == "WAIT":
-        if len(instruction) != 2:
-            raise ValueError("WAIT syntax: ('WAIT', cycles)")
-        cycles = instruction[1]
-        cpu_wait(cpu, cycles)
-        cpu.pc += 1
-    elif opcode == "JUMP":
-        if len(instruction) != 2:
-            raise ValueError("JUMP syntax: ('JUMP', offset)")
-        offset = instruction[1]
-        jump_offset(cpu, offset)
-        cpu.cycle += 1
-    elif opcode == "HALT":
-        if len(instruction) != 1:
-            raise ValueError("HALT syntax: ('HALT')")
-        cpu_halt(cpu)
-        cpu.cycle += 1
-    elif opcode == "IN":
-        if len(instruction) != 4:
-            raise ValueError("IN syntax: ('IN', direction, register, pin)")
-        direction = instruction[1]
-        register = instruction[2]
-        pin = instruction[3]
-        register_in(cpu, direction, register, pin)
-        cpu.cycle += 1
-    elif opcode == "SHIFT":
-        if len(instruction) != 4:
-            raise ValueError("SHIFT syntax: ('SHIFT', direction, register, amount)")
-        direction = instruction[1]
-        register = instruction[2]
-        value = instruction[3]
 
-        shift_reg(cpu, direction, register, value)
-        cpu.cycle += 1
+    if opcode == "SET":
+        set_gpio(cpu, instruction[1], instruction[2])
+    elif opcode == "MOV":
+        move_data(cpu, instruction[1], instruction[2])
+    elif opcode == "WAIT":
+        cpu_wait(cpu, instruction[1])
+    elif opcode == "JUMP":
+        jump_offset(cpu, instruction[1])
+    elif opcode == "HALT":
+        cpu_halt(cpu)
+    elif opcode == "IN":
+        register_in(cpu, instruction[1], instruction[2], instruction[3])
+    elif opcode == "SHIFT":
+        shift_reg(cpu, instruction[1], instruction[2], instruction[3])
     elif opcode == "WAIT_PIN":
-        if not 3 <= len(instruction) <= 5:
-            raise ValueError("WAIT_PIN syntax: ""('WAIT_PIN', pin, value, mode?, timeout?)")
         pin = instruction[1]
         value = instruction[2]
         mode = instruction[3] if len(instruction) >= 4 else "LEVEL"
         timeout = instruction[4] if len(instruction) == 5 else None
         wait_pin(cpu, pin, value, mode, timeout)
     elif opcode == "DIR":
-        if len(instruction) != 3:
-            raise ValueError("DIR syntax: ('DIR', pin, direction)")
         set_gpio_dir(cpu, instruction[1], instruction[2])
-        cpu.pc += 1
-    else:
-        raise ValueError(f"Unknown opcode: {opcode}")
 
-#Only for testing purpose of WAIT_IN
+
+# Only for testing purpose of WAIT_PIN
 def update_external_gpio(cpu: CPU):
-    if cpu.cycle >= 5:
+    if cpu.cycle >= 5 and cpu.gpio_dir[3] == GPIO_INPUT:
         cpu.gpio[3] = 1
 
 
 def run(cpu, program, max_cycles=1000, environment=None):
+    """Simple standalone runner (no wires). The GUI uses engine.py instead."""
     while not cpu.halted:
         if cpu.cycle >= max_cycles:
             raise TimeoutError("Simulation exceeded cycle limit")
