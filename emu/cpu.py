@@ -12,6 +12,8 @@ GPIO_COUNT = 8
 GPIO_INPUT = 0
 GPIO_OUTPUT = 1
 
+TIMER_COUNT = 4
+WINDOW_MAX = 8
 
 @dataclass
 class CPU:
@@ -52,3 +54,6 @@ class CPU:
 
     # Non-fatal diagnostics (e.g. SET on a pin configured as INPUT)
     warnings: list[str] = field(default_factory=list)
+
+    # 4 general-purpose timing registers: T0-T3
+    timer: list[int] = field(default_factory=lambda: [0] * TIMER_COUNT)

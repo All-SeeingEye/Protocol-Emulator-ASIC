@@ -33,6 +33,14 @@ def _check_level(value) -> int:
         raise ValueError(f"GPIO value must be 0 or 1: {value}")
     return value
 
+def _check_timer(timer) -> int:
+    _int("Timer register", timer)
+
+    if not 0 <= timer < TIMER_COUNT:
+        raise ValueError(f"Invalid timer register: T{timer}")
+
+    return timer
+
 
 # ============================================================
 #    SET pin, value
@@ -64,8 +72,8 @@ def set_gpio(cpu: CPU, pin: int, value: int) -> None:
     cpu.cycle += 1
 
 # ============================================================
-# MOV
-#    MOV Rd, immediate
+# LOAD
+#    LOAD Rd, immediate
 #
 #    Semantics:
 #        R[Rd] <- immediate
@@ -77,9 +85,9 @@ def set_gpio(cpu: CPU, pin: int, value: int) -> None:
 #        PC <- PC + 1
 # ============================================================
 
-def move_data(cpu: CPU, register: int, value: int) -> None:
+def load_data(cpu: CPU, register: int, value: int) -> None:
     _check_reg(register)
-    _int("MOV immediate", value)
+    _int("LOAD immediate", value)
 
     cpu.reg[register] = value & REG_MASK
     cpu.pc += 1
@@ -351,3 +359,341 @@ def set_gpio_dir(cpu: CPU, pin: int, direction: int):
         cpu.gpio[pin] = cpu.gpio_out[pin]
     cpu.pc += 1
     cpu.cycle += 1
+
+# ============================================================
+# OUT
+#    OUT DIRECTION PIN REGISTER
+#
+#    Semantics:
+#        R: REG <- (REG >> 1) | (GPIO[pin] << 31)   (LSB-first receive)
+#        L: REG <- (REG << 1) | GPIO[pin]           (MSB-first receive)
+#
+#    Timing:
+#        1 cycle
+# ============================================================
+
+def register_out(
+    cpu: CPU,
+    direction: str,
+    register: int,
+    pin: int
+) -> None:
+
+    if direction not in ("L", "R"):
+        raise ValueError("OUT direction must be L or R")
+
+    _check_reg(register)
+    _check_pin(pin)
+
+    if direction == "R":
+        # LSB-first:
+        # output bit 0, then shift register right
+        bit = cpu.reg[register] & 1
+        cpu.reg[register] >>= 1
+
+    else:
+        # MSB-first:
+        # output bit 31, then shift register left
+        bit = (cpu.reg[register] >> (REG_WIDTH - 1)) & 1
+        cpu.reg[register] = (
+            cpu.reg[register] << 1
+        ) & REG_MASK
+
+    # Update output latch
+    if cpu.gpio_out[pin] != bit:
+        cpu.gpio_out[pin] = bit
+        cpu.waveform.append(
+            (cpu.cycle, pin, bit)
+        )
+
+    # Drive physical/observed pin only when configured as output
+    if cpu.gpio_dir[pin] == GPIO_OUTPUT:
+        cpu.gpio[pin] = bit
+
+    cpu.pc += 1
+    cpu.cycle += 1
+
+def move_register(
+    cpu: CPU,
+    dst_register: int,
+    src_register: int
+) -> None:
+
+    _check_reg(dst_register)
+    _check_reg(src_register)
+
+    cpu.reg[dst_register] = cpu.reg[src_register] & REG_MASK
+
+    cpu.pc += 1
+    cpu.cycle += 1
+
+def load_timer(cpu: CPU, timer: int, value: int) -> None:
+    _check_timer(timer)
+    _int("Timer value", value)
+
+    if value < 0:
+        raise ValueError("Timer value cannot be negative")
+
+    cpu.timer[timer] = value & REG_MASK
+
+    cpu.pc += 1
+    cpu.cycle += 1
+
+def wait_timer(cpu: CPU, timer: int) -> None:
+    _check_timer(timer)
+
+    cpu.cycle += cpu.timer[timer]
+    cpu.pc += 1
+
+# ============================================================
+# OUT_W
+#    OUT_W DIRECTION REGISTER PIN COUNT TIMER
+#
+# Semantics:
+#    R:
+#       GPIO <- REG[0]
+#       REG  <- REG >> 1
+#
+#    L:
+#       GPIO <- REG[31]
+#       REG  <- REG << 1
+#
+#    Repeated COUNT times.
+#    After every transmitted bit, wait TIMER cycles.
+#
+# Timing:
+#    COUNT * (1 + TIMER_VALUE) cycles
+#
+# Example:
+#    ("OUT_W", "R", 0, 0, 8, 0)
+#
+#    Send 8 LSB-first bits from R0 onto GPIO0,
+#    using T0 as the inter-bit delay.
+# ============================================================
+
+def register_out_window(
+    cpu: CPU,
+    direction: str,
+    register: int,
+    pin: int,
+    count: int,
+    timer: int
+) -> None:
+
+    if direction not in ("L", "R"):
+        raise ValueError("OUT_W direction must be L or R")
+
+    _check_reg(register)
+    _check_pin(pin)
+    _check_timer(timer)
+
+    _int("OUT_W count", count)
+
+    if not 1 <= count <= WINDOW_MAX:
+        raise ValueError(
+            f"OUT_W count must be between 1 and {WINDOW_MAX}"
+        )
+
+    key = (
+        cpu.pc,
+        "OUT_W",
+        direction,
+        register,
+        pin,
+        count,
+        timer
+    )
+
+    # Initialise this window instruction.
+    if (
+        cpu.window_state is None
+        or cpu.window_state["key"] != key
+    ):
+        cpu.window_state = {
+            "key": key,
+            "bits_left": count,
+            "delay_left": 0,
+        }
+
+    state = cpu.window_state
+
+    # --------------------------------------------------
+    # Waiting between bits
+    # --------------------------------------------------
+    if state["delay_left"] > 0:
+        state["delay_left"] -= 1
+        cpu.cycle += 1
+
+        # Final delay finished -> instruction complete
+        if (
+            state["delay_left"] == 0
+            and state["bits_left"] == 0
+        ):
+            cpu.pc += 1
+            cpu.window_state = None
+
+        return
+
+    # --------------------------------------------------
+    # Output next bit
+    # --------------------------------------------------
+    if direction == "R":
+        bit = cpu.reg[register] & 1
+        cpu.reg[register] >>= 1
+
+    else:
+        bit = (
+            cpu.reg[register] >> (REG_WIDTH - 1)
+        ) & 1
+
+        cpu.reg[register] = (
+            cpu.reg[register] << 1
+        ) & REG_MASK
+
+    # Update output latch.
+    if cpu.gpio_out[pin] != bit:
+        cpu.gpio_out[pin] = bit
+
+        cpu.waveform.append(
+            (cpu.cycle, pin, bit)
+        )
+
+    # Drive observed pin if configured as OUTPUT.
+    if cpu.gpio_dir[pin] == GPIO_OUTPUT:
+        cpu.gpio[pin] = bit
+
+    state["bits_left"] -= 1
+
+    # Timer value specifies delay after this bit.
+    state["delay_left"] = cpu.timer[timer]
+
+    cpu.cycle += 1
+
+    # TIMER == 0 and this was the final bit.
+    if (
+        state["bits_left"] == 0
+        and state["delay_left"] == 0
+    ):
+        cpu.pc += 1
+        cpu.window_state = None
+
+# ============================================================
+# IN_W
+#    IN_W DIRECTION REGISTER PIN COUNT TIMER
+#
+# Semantics:
+#    R:
+#       REG <- (REG >> 1) | (GPIO << 31)
+#
+#    L:
+#       REG <- (REG << 1) | GPIO
+#
+#    Repeated COUNT times.
+#    After every sampled bit, wait TIMER cycles.
+#
+# Timing:
+#    COUNT * (1 + TIMER_VALUE) cycles
+#
+# Example:
+#    ("IN_W", "R", 0, 3, 8, 0)
+#
+#    Receive 8 LSB-first bits from GPIO3 into R0,
+#    using T0 as the inter-bit delay.
+# ============================================================
+
+def register_in_window(
+    cpu: CPU,
+    direction: str,
+    register: int,
+    pin: int,
+    count: int,
+    timer: int
+) -> None:
+
+    if direction not in ("L", "R"):
+        raise ValueError("IN_W direction must be L or R")
+
+    _check_reg(register)
+    _check_pin(pin)
+    _check_timer(timer)
+
+    _int("IN_W count", count)
+
+    if not 1 <= count <= WINDOW_MAX:
+        raise ValueError(
+            f"IN_W count must be between 1 and {WINDOW_MAX}"
+        )
+
+    key = (
+        cpu.pc,
+        "IN_W",
+        direction,
+        register,
+        pin,
+        count,
+        timer
+    )
+
+    # Initialise this window instruction.
+    if (
+        cpu.window_state is None
+        or cpu.window_state["key"] != key
+    ):
+        cpu.window_state = {
+            "key": key,
+            "bits_left": count,
+            "delay_left": 0,
+        }
+
+    state = cpu.window_state
+
+    # --------------------------------------------------
+    # Waiting between samples
+    # --------------------------------------------------
+    if state["delay_left"] > 0:
+        state["delay_left"] -= 1
+        cpu.cycle += 1
+
+        if (
+            state["delay_left"] == 0
+            and state["bits_left"] == 0
+        ):
+            cpu.pc += 1
+            cpu.window_state = None
+
+        return
+
+    # --------------------------------------------------
+    # Sample next bit
+    # --------------------------------------------------
+    bit = cpu.gpio[pin]
+
+    if bit not in (0, 1):
+        raise ValueError("Invalid GPIO value")
+
+    if direction == "R":
+
+        cpu.reg[register] = (
+            (cpu.reg[register] >> 1)
+            | (bit << (REG_WIDTH - 1))
+        ) & REG_MASK
+
+    else:
+
+        cpu.reg[register] = (
+            (cpu.reg[register] << 1)
+            | bit
+        ) & REG_MASK
+
+    state["bits_left"] -= 1
+    state["delay_left"] = cpu.timer[timer]
+
+    cpu.cycle += 1
+
+    if (
+        state["bits_left"] == 0
+        and state["delay_left"] == 0
+    ):
+        cpu.pc += 1
+        cpu.window_state = None
+

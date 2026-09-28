@@ -127,35 +127,61 @@ class Core:
     def step(self):
         """Execute exactly one cycle. Returns (pc, instruction) that used it."""
         cpu, program = self.cpu, self.program
+
         if self.wait_left == 0:
-            # WAIT 0 takes no time: skip over any chain of them.
+            # WAIT / WAIT_T can consume multiple cycles.
+            # WAIT 0 and WAIT_T with timer=0 consume zero cycles, so skip
+            # over any chain of zero-length waits before executing this step.
             while True:
                 if not 0 <= cpu.pc < len(program):
                     raise RuntimeError(f'PC {cpu.pc} outside program (length {len(program)})')
+
                 ins = program[cpu.pc]
-                if ins[0] != 'WAIT':
+                opcode = ins[0]
+
+                if opcode == 'WAIT':
+                    check_syntax(ins)
+                    if type(ins[1]) is not int or ins[1] < 0:
+                        raise ValueError('WAIT expects a nonnegative integer cycle count')
+                    wait_cycles = ins[1]
+
+                elif opcode == 'WAIT_T':
+                    check_syntax(ins)
+                    timer = ins[1]
+                    if type(timer) is not int:
+                        raise ValueError('WAIT_T expects an integer timer index')
+                    if not 0 <= timer < len(cpu.timer):
+                        raise ValueError(f'Invalid timer register: T{timer}')
+                    wait_cycles = cpu.timer[timer]
+
+                else:
                     break
-                check_syntax(ins)
-                if type(ins[1]) is not int or ins[1] < 0:
-                    raise ValueError('WAIT expects a nonnegative integer cycle count')
-                if ins[1] > 0:
-                    self.wait_left = ins[1]
-                    break
-                cpu.pc += 1
+
+                if wait_cycles == 0:
+                    cpu.pc += 1
+                    continue
+
+                self.wait_left = wait_cycles
+                break
 
         pc, ins = cpu.pc, program[cpu.pc]
         start = cpu.cycle
+
         if self.wait_left:
-            # Multi-cycle WAIT is spread over cycles so the other CPU and
-            # external events keep running while this one waits.
+            # Multi-cycle WAIT / WAIT_T is spread over global cycles so
+            # other CPUs, wires, and external events continue to advance.
             cpu.cycle += 1
             self.wait_left -= 1
             if self.wait_left == 0:
                 cpu.pc += 1
         else:
             execute(cpu, ins)
+
         if cpu.cycle != start + 1:
-            raise RuntimeError(f'Internal timing error: {ins} advanced {cpu.cycle - start} cycles in one step')
+            raise RuntimeError(
+                f'Internal timing error: {ins} advanced {cpu.cycle - start} cycles in one step'
+            )
+
         return pc, ins
 
     def record(self, t, pc, ins):
@@ -165,6 +191,7 @@ class Core:
             **{f'GPIO{i}': cpu.gpio[i] for i in range(GPIO_COUNT)},
             **{f'DIR{i}': cpu.gpio_dir[i] for i in range(GPIO_COUNT)},
             **{f'R{i}': cpu.reg[i] for i in range(REG_COUNT)},
+            **{f'T{i}': cpu.timer[i] for i in range(len(cpu.timer))},
         })
 
 
@@ -278,7 +305,7 @@ class System:
                                  **{f'{n.name} driver': n.driver for n in self.nets if n.shared}})
                 t += 1
             # Settle wires once more so final INPUT levels reflect final outputs.
-            self._apply_events(t)
+            # Do not apply future external events after all CPUs have halted.
             self._resolve(t)
         except Exception as exc:
             where = f'{current.name} @ PC {current.cpu.pc}, cycle {t}: ' if current else ''

@@ -4,7 +4,7 @@ from cpu import *
 # Operand count for each opcode (including the opcode itself).
 SYNTAX = {
     "SET":      ((3, 3), "('SET', pin, value)"),
-    "MOV":      ((3, 3), "('MOV', register, immediate)"),
+    "LOAD":      ((3, 3), "('LOAD', register, immediate)"),
     "WAIT":     ((2, 2), "('WAIT', cycles)"),
     "JUMP":     ((2, 2), "('JUMP', offset)"),
     "HALT":     ((1, 1), "('HALT',)"),
@@ -12,6 +12,12 @@ SYNTAX = {
     "SHIFT":    ((4, 4), "('SHIFT', direction, register, amount)"),
     "WAIT_PIN": ((3, 5), "('WAIT_PIN', pin, value, mode?, timeout?)"),
     "DIR":      ((3, 3), "('DIR', pin, direction)"),
+    "MOV":      ((3, 3), "('MOV', dst_register, src_register)"),
+    "OUT":      ((4, 4), "('OUT', direction, pin, register)"),
+    "LOAD_T":   ((3, 3), "('LOAD_T', timer, value)"),
+    "WAIT_T":   ((2, 2), "('WAIT_T', timer)"),
+    "OUT_W":    ((6, 6), "('OUT_W', direction, register, pin, count, timer)"),
+    "IN_W":     ((6, 6),"('IN_W', direction, register, pin, count, timer)"),
 }
 
 
@@ -31,8 +37,8 @@ def execute(cpu: CPU, instruction: tuple) -> None:
 
     if opcode == "SET":
         set_gpio(cpu, instruction[1], instruction[2])
-    elif opcode == "MOV":
-        move_data(cpu, instruction[1], instruction[2])
+    elif opcode == "LOAD":
+        load_data(cpu, instruction[1], instruction[2])
     elif opcode == "WAIT":
         cpu_wait(cpu, instruction[1])
     elif opcode == "JUMP":
@@ -41,6 +47,8 @@ def execute(cpu: CPU, instruction: tuple) -> None:
         cpu_halt(cpu)
     elif opcode == "IN":
         register_in(cpu, instruction[1], instruction[2], instruction[3])
+    elif opcode == "OUT":
+        register_out(cpu, instruction[1], instruction[2], instruction[3])
     elif opcode == "SHIFT":
         shift_reg(cpu, instruction[1], instruction[2], instruction[3])
     elif opcode == "WAIT_PIN":
@@ -51,6 +59,16 @@ def execute(cpu: CPU, instruction: tuple) -> None:
         wait_pin(cpu, pin, value, mode, timeout)
     elif opcode == "DIR":
         set_gpio_dir(cpu, instruction[1], instruction[2])
+    elif opcode == "MOV":
+        move_register(cpu,instruction[1],instruction[2])
+    elif opcode == "LOAD_T":
+        load_timer(cpu, instruction[1], instruction[2])
+    elif opcode == "WAIT_T":
+        wait_timer( cpu, instruction[1])
+    elif opcode == "OUT_W":
+        register_out_window(cpu, instruction[1], instruction[2], instruction[3], instruction[4], instruction[5])
+    elif opcode == "IN_W":
+        register_in_window(cpu, instruction[1], instruction[2], instruction[3], instruction[4], instruction[5])
 
 
 # Only for testing purpose of WAIT_PIN
