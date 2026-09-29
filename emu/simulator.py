@@ -16,8 +16,12 @@ SYNTAX = {
     "OUT":      ((4, 4), "('OUT', direction, pin, register)"),
     "LOAD_T":   ((3, 3), "('LOAD_T', timer, value)"),
     "WAIT_T":   ((2, 2), "('WAIT_T', timer)"),
-    "OUT_W":    ((6, 6), "('OUT_W', direction, register, pin, count, timer)"),
-    "IN_W":     ((6, 6),"('IN_W', direction, register, pin, count, timer)"),
+    "OUT_W":    ((6, 6),"('OUT_W', direction, register, pin, count_register, timer)"),
+    "IN_W":     ((6, 6),"('IN_W', direction, register, pin, count_register, timer)"),
+    "CMP":      ((3, 3),"('CMP', reg_a, reg_b)"),
+    "CMPI":     ((3, 3),"('CMPI', register, immediate)"),
+    "JCC":      ((3, 3),"('JCC', condition, offset)"),
+    "LOOP":     ((3, 3),"('LOOP', register, offset)"),
 }
 
 
@@ -52,11 +56,9 @@ def execute(cpu: CPU, instruction: tuple) -> None:
     elif opcode == "SHIFT":
         shift_reg(cpu, instruction[1], instruction[2], instruction[3])
     elif opcode == "WAIT_PIN":
-        pin = instruction[1]
-        value = instruction[2]
         mode = instruction[3] if len(instruction) >= 4 else "LEVEL"
         timeout = instruction[4] if len(instruction) == 5 else None
-        wait_pin(cpu, pin, value, mode, timeout)
+        wait_pin(cpu, instruction[1], instruction[2], mode, timeout)
     elif opcode == "DIR":
         set_gpio_dir(cpu, instruction[1], instruction[2])
     elif opcode == "MOV":
@@ -69,6 +71,14 @@ def execute(cpu: CPU, instruction: tuple) -> None:
         register_out_window(cpu, instruction[1], instruction[2], instruction[3], instruction[4], instruction[5])
     elif opcode == "IN_W":
         register_in_window(cpu, instruction[1], instruction[2], instruction[3], instruction[4], instruction[5])
+    elif opcode == "CMP":
+        compare_registers(cpu, instruction[1], instruction[2])
+    elif opcode == "CMPI":
+        compare_immediate(cpu, instruction[1], instruction[2])
+    elif opcode == "JCC":
+        conditional_jump(cpu, instruction[1], instruction[2])
+    elif opcode == "LOOP":
+        loop_register(cpu, instruction[1], instruction[2])
 
 
 # Only for testing purpose of WAIT_PIN

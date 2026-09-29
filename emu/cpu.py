@@ -15,6 +15,11 @@ GPIO_OUTPUT = 1
 TIMER_COUNT = 4
 WINDOW_MAX = 8
 
+FLAG_Z = 1 << 0    # Zero
+FLAG_N = 1 << 1    # Negative
+FLAG_C = 1 << 2    # Carry / no-borrow
+FLAG_V = 1 << 3    # Signed overflow
+
 @dataclass
 class CPU:
     # Program counter
@@ -57,3 +62,6 @@ class CPU:
 
     # 4 general-purpose timing registers: T0-T3
     timer: list[int] = field(default_factory=lambda: [0] * TIMER_COUNT)
+
+    # Comparison / ALU flags
+    flags: int = 0

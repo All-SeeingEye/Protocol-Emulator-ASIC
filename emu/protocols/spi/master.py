@@ -1,27 +1,130 @@
-#implementing SPI 0, further modifications will be seen with SPI 1 2 3
+program = [
+    # --------------------------------------------------
+    # Data setup
+    # --------------------------------------------------
+    ("LOAD", 0, 0xA5),
 
-# CS line (0 means on and 1 means off)
-# We will start by wasting 10 cycles to show "off" then "on" mode for 200 cycles, changing the number after data excahnge is completed.
-#starting with off
-#GPIO 0 will be CS line
-DIR 0 1 
-SET 0 1
-WAIT 10
-#turning the system on
-SET 0 0
-WAIT 200
+    # Move byte into bits [31:24]
+    ("SHIFT", "L", 0, 24),
 
+    # Half-clock delay
+    ("LOAD_T", 0, 4),
 
-# SCLK
-# common clock, let GPIO 1 be the clock
-# new instruction TOGGLE
-# it should toglle a gpio pin with the amount of cycles mentioned
-DIR 1 1
-TOGGLE 1 1
+    # --------------------------------------------------
+    # Configure pins
+    # --------------------------------------------------
+    ("SET", 0, 0),      # SCLK idle LOW
+    ("DIR", 0, 1),
 
-# MOSI (master out slave in)
-DIR 2 1
+    ("SET", 1, 0),      # MOSI
+    ("DIR", 1, 1),
 
-# new instruction OUT to take data from register to pin
-OUT 0 1 
-# MISO (master in slave out)
+    ("SET", 2, 1),      # CS idle HIGH
+    ("DIR", 2, 1),
+
+    # --------------------------------------------------
+    # Select slave
+    # --------------------------------------------------
+    ("SET", 2, 0),
+
+    # --------------------------------------------------
+    # Bit 7
+    # --------------------------------------------------
+
+    # Put next MOSI bit on wire
+    ("OUT", "L", 0, 1),
+
+    # Hold data before rising edge
+    ("WAIT_T", 0),
+
+    # Rising edge: slave samples here
+    ("SET", 0, 1),
+    ("WAIT_T", 0),
+
+    # Falling edge
+    ("SET", 0, 0),
+
+    # --------------------------------------------------
+    # Bit 6
+    # --------------------------------------------------
+    ("OUT", "L", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 0),
+
+    # --------------------------------------------------
+    # Bit 5
+    # --------------------------------------------------
+    ("OUT", "L", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 0),
+
+    # --------------------------------------------------
+    # Bit 4
+    # --------------------------------------------------
+    ("OUT", "L", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 0),
+
+    # --------------------------------------------------
+    # Bit 3
+    # --------------------------------------------------
+    ("OUT", "L", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 0),
+
+    # --------------------------------------------------
+    # Bit 2
+    # --------------------------------------------------
+    ("OUT", "L", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 0),
+
+    # --------------------------------------------------
+    # Bit 1
+    # --------------------------------------------------
+    ("OUT", "L", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 0),
+
+    # --------------------------------------------------
+    # Bit 0
+    # --------------------------------------------------
+    ("OUT", "L", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 1),
+    ("WAIT_T", 0),
+
+    ("SET", 0, 0),
+
+    # --------------------------------------------------
+    # End transaction
+    # --------------------------------------------------
+    ("SET", 2, 1),      # CS HIGH
+
+    ("HALT",),
+]T 
