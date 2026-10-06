@@ -54,6 +54,9 @@ class CPU:
     # The state is temporary and is cleared when the instruction completes.
     wait_pin_state: Optional[dict] = None
 
+    # Temporary state for OUT_W / IN_W
+    window_state: Optional[dict] = None
+
     # Records output-latch transitions made by SET: (cycle, pin, value)
     waveform: list[tuple[int, int, int]] = field(default_factory=list)
 

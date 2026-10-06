@@ -22,6 +22,10 @@ SYNTAX = {
     "CMPI":     ((3, 3),"('CMPI', register, immediate)"),
     "JCC":      ((3, 3),"('JCC', condition, offset)"),
     "LOOP":     ((3, 3),"('LOOP', register, offset)"),
+    "ADD":      ((3, 3), "('ADD', dst_register, src_register)"),
+    "ADDI":     ((3, 3), "('ADDI', dst_register, immediate)"),
+    "SUB":      ((3, 3), "('SUB', dst_register, src_register)"),
+    "SUBI":     ((3, 3), "('SUBI', dst_register, immediate)"),
 }
 
 
@@ -77,8 +81,18 @@ def execute(cpu: CPU, instruction: tuple) -> None:
         compare_immediate(cpu, instruction[1], instruction[2])
     elif opcode == "JCC":
         conditional_jump(cpu, instruction[1], instruction[2])
-    elif opcode == "LOOP":
-        loop_register(cpu, instruction[1], instruction[2])
+    # elif opcode == "LOOP":
+    #     loop_register(cpu, instruction[1], instruction[2])
+    elif opcode == "ADD":
+        add_register(cpu, instruction[1], instruction[2])
+    elif opcode == "ADDI":
+        add_immediate(cpu, instruction[1], instruction[2])
+    elif opcode == "SUB":
+        sub_register(cpu, instruction[1], instruction[2])
+    elif opcode == "SUBI":
+        sub_immediate(cpu, instruction[1], instruction[2])
+    elif opcode == "CLK":
+        clock_edge(cpu, instruction[1], instruction[2])
 
 
 # Only for testing purpose of WAIT_PIN

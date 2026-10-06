@@ -38,7 +38,35 @@ def _check_timer(timer) -> int:
 
     return timer
 
+def _set_add_flags(cpu: CPU, a: int, b: int, result: int) -> None:
+    cpu.flags &= ~(FLAG_Z | FLAG_N | FLAG_C | FLAG_V)
+    result_masked = result & REG_MASK
 
+    if result_masked == 0:
+        cpu.flags |= FLAG_Z
+    if result_masked & (1 << (REG_WIDTH - 1)):
+        cpu.flags |= FLAG_N
+    if result > REG_MASK:
+        cpu.flags |= FLAG_C
+
+    sign_bit = 1 << (REG_WIDTH - 1)
+    if (~(a ^ b) & (a ^ result_masked) & sign_bit) != 0:
+        cpu.flags |= FLAG_V
+
+def _set_sub_flags(cpu: CPU, a: int, b: int, result: int) -> None:
+    cpu.flags &= ~(FLAG_Z | FLAG_N | FLAG_C | FLAG_V)
+    result_masked = result & REG_MASK
+
+    if result_masked == 0:
+        cpu.flags |= FLAG_Z
+    if result_masked & (1 << (REG_WIDTH - 1)):
+        cpu.flags |= FLAG_N
+    if a >= b:
+        cpu.flags |= FLAG_C
+
+    sign_bit = 1 << (REG_WIDTH - 1)
+    if ((a ^ b) & (a ^ result_masked) & sign_bit) != 0:
+        cpu.flags |= FLAG_V
 # ============================================================
 #    SET pin, value
 #
@@ -610,7 +638,7 @@ def compare_registers(cpu: CPU, reg_a: int, reg_b: int) -> None:
     result = (a - b) & REG_MASK
 
     # Clear previous comparison flags
-    cpu.flags = 0
+    _set_sub_flags(cpu, a, b, result)
 
     # --------------------------------------------------
     # Z: result == 0
@@ -720,14 +748,98 @@ def conditional_jump(cpu: CPU, condition: str, offset: int) -> None:
 
     cpu.cycle += 1
 
-def loop_register(cpu: CPU, register: int, offset: int) -> None:
+# def loop_register(cpu: CPU, register: int, offset: int) -> None:
+#     _check_reg(register)
+#     _int("LOOP offset", offset)
 
-    _check_reg(register)
-    _int("LOOP offset", offset)
-    cpu.reg[register] = (cpu.reg[register] - 1) & REG_MASK
+#     if cpu.reg[register] == 0:
+#         cpu.pc += 1
+#         cpu.cycle += 1
+#         return
 
-    if cpu.reg[register] != 0:
-        cpu.pc += offset
-    else:
-        cpu.pc += 1
+#     cpu.reg[register] -= 1
+
+#     if cpu.reg[register] != 0:
+#         cpu.pc += offset
+#     else:
+#         cpu.pc += 1
+
+#     cpu.cycle += 1
+
+def add_register(cpu: CPU, dst: int, src: int) -> None:
+    _check_reg(dst)
+    _check_reg(src)
+
+    a = cpu.reg[dst] & REG_MASK
+    b = cpu.reg[src] & REG_MASK
+    result = a + b
+
+    cpu.reg[dst] = result & REG_MASK
+    _set_add_flags(cpu, a, b, result)
+
+    cpu.pc += 1
     cpu.cycle += 1
+
+def add_immediate(cpu: CPU, dst: int, immediate: int) -> None:
+    _check_reg(dst)
+    _int("ADDI immediate", immediate)
+
+    a = cpu.reg[dst] & REG_MASK
+    b = immediate & REG_MASK
+    result = a + b
+
+    cpu.reg[dst] = result & REG_MASK
+    _set_add_flags(cpu, a, b, result)
+
+    cpu.pc += 1
+    cpu.cycle += 1
+
+def sub_register(cpu: CPU, dst: int, src: int) -> None:
+    _check_reg(dst)
+    _check_reg(src)
+
+    a = cpu.reg[dst] & REG_MASK
+    b = cpu.reg[src] & REG_MASK
+    result = a - b
+
+    cpu.reg[dst] = result & REG_MASK
+    _set_sub_flags(cpu, a, b, result)
+
+    cpu.pc += 1
+    cpu.cycle += 1
+
+def sub_immediate(cpu: CPU, dst: int, immediate: int) -> None:
+    _check_reg(dst)
+    _int("SUBI immediate", immediate)
+
+    a = cpu.reg[dst] & REG_MASK
+    b = immediate & REG_MASK
+    result = a - b
+
+    cpu.reg[dst] = result & REG_MASK
+    _set_sub_flags(cpu, a, b, result)
+
+    cpu.pc += 1
+    cpu.cycle += 1
+
+def clock_edge(cpu: CPU, pin: int, edge: str) -> None:
+    _check_pin(pin)
+
+    if edge not in ("LEAD", "TRAIL"):
+        raise ValueError("CLK edge must be LEAD or TRAIL")
+
+    if edge == "LEAD":
+        value = 1 - cpu.cpol
+    else:
+        value = cpu.cpol
+
+    if cpu.gpio_out[pin] != value:
+        cpu.gpio_out[pin] = value
+        cpu.waveform.append((cpu.cycle, pin, value))
+
+    if cpu.gpio_dir[pin] == GPIO_OUTPUT:
+        cpu.gpio[pin] = value
+
+    cpu.pc += 1
+    cpu.cycle += 1
+
