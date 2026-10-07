@@ -16,7 +16,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from cpu import CPU, GPIO_COUNT, REG_COUNT, REG_MASK, GPIO_OUTPUT
-from simulator import execute, check_syntax
+from simulator import execute, check_syntax, split_modifier
+from isa import apply_modifier
 
 READ_KEYS = ('program', 'external_events', 'initial_gpio', 'initial_gpio_dir', 'initial_regs')
 
@@ -108,6 +109,7 @@ class Core:
         self.events = sorted(events, key=lambda e: e[0])     # stable
         self.event_index = 0
         self.wait_left = 0
+        self.wait_modifier_applied = False
         self.rows = []
 
         cpu = CPU()
@@ -124,38 +126,52 @@ class Core:
         self.initial_gpio = list(cpu.gpio)
         self.cpu = cpu
 
+        
+
     def step(self):
         """Execute exactly one cycle. Returns (pc, instruction) that used it."""
         cpu, program = self.cpu, self.program
 
         if self.wait_left == 0:
-            # WAIT / WAIT_T can consume multiple cycles.
-            # WAIT 0 and WAIT_T with timer=0 consume zero cycles, so skip
-            # over any chain of zero-length waits before executing this step.
             while True:
                 if not 0 <= cpu.pc < len(program):
                     raise RuntimeError(f'PC {cpu.pc} outside program (length {len(program)})')
 
                 ins = program[cpu.pc]
-                opcode = ins[0]
+                core_ins, modifier = split_modifier(ins)
+                opcode = core_ins[0]
 
                 if opcode == 'WAIT':
                     check_syntax(ins)
-                    if type(ins[1]) is not int or ins[1] < 0:
+
+                    if type(core_ins[1]) is not int or core_ins[1] < 0:
                         raise ValueError('WAIT expects a nonnegative integer cycle count')
-                    wait_cycles = ins[1]
+
+                    if wait_cycles == 0:
+                        if modifier is not None:
+                            raise ValueError("SIDE cannot be attached to a zero-cycle WAIT")
+                        continue
+
+                    wait_cycles = core_ins[1]
 
                 elif opcode == 'WAIT_T':
                     check_syntax(ins)
-                    timer = ins[1]
+
+                    timer = core_ins[1]
+
                     if type(timer) is not int:
                         raise ValueError('WAIT_T expects an integer timer index')
+
                     if not 0 <= timer < len(cpu.timer):
                         raise ValueError(f'Invalid timer register: T{timer}')
+
                     wait_cycles = cpu.timer[timer]
 
                 else:
                     break
+
+                if modifier is not None:
+                    apply_modifier(cpu, modifier)
 
                 if wait_cycles == 0:
                     cpu.pc += 1
@@ -168,12 +184,12 @@ class Core:
         start = cpu.cycle
 
         if self.wait_left:
-            # Multi-cycle WAIT / WAIT_T is spread over global cycles so
-            # other CPUs, wires, and external events continue to advance.
             cpu.cycle += 1
             self.wait_left -= 1
+
             if self.wait_left == 0:
                 cpu.pc += 1
+
         else:
             execute(cpu, ins)
 

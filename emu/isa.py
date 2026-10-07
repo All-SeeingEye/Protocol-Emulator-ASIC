@@ -5,7 +5,7 @@ from cpu import *
 # PC and cycle update. simulator.execute() only decodes.
 # ============================================================
 
-
+# helper functions for cleaner code
 def _int(name: str, value) -> int:
     # bool is a subclass of int; reject it so (SET, 0, True) is caught.
     if type(value) is not int:
@@ -67,24 +67,53 @@ def _set_sub_flags(cpu: CPU, a: int, b: int, result: int) -> None:
     sign_bit = 1 << (REG_WIDTH - 1)
     if ((a ^ b) & (a ^ result_masked) & sign_bit) != 0:
         cpu.flags |= FLAG_V
-# ============================================================
-#    SET pin, value
-#
-#    Semantics:
-#        GPIO_OUT[pin] <- value
-#        if DIR[pin] == OUTPUT: GPIO[pin] <- value
-#        (on an INPUT pin only the latch changes: pre-load before DIR)
-#    Timing:
-#        1 cycle
-#
-#    PC:
-#       PC <- PC + 1
-# ============================================================
 
-def set_gpio(cpu: CPU, pin: int, value: int) -> None:
+def apply_side_set(cpu: CPU, enable_mask: int, value_mask: int) -> None:
+    _int("SIDE enable mask", enable_mask)
+    _int("SIDE value mask", value_mask)
+
+    if enable_mask < 0 or enable_mask >= (1 << GPIO_COUNT):
+        raise ValueError("SIDE enable mask exceeds GPIO width")
+
+    if value_mask < 0 or value_mask >= (1 << GPIO_COUNT):
+        raise ValueError("SIDE value mask exceeds GPIO width")
+
+    for pin in range(GPIO_COUNT):
+        if enable_mask & (1 << pin):
+            value = (value_mask >> pin) & 1
+
+            if cpu.gpio_out[pin] != value:
+                cpu.gpio_out[pin] = value
+                cpu.waveform.append((cpu.cycle, pin, value))
+
+            if cpu.gpio_dir[pin] == GPIO_OUTPUT:
+                cpu.gpio[pin] = value
+
+def apply_modifier(cpu: CPU, modifier: Optional[tuple]) -> None:
+    if modifier is None:
+        return
+
+    if len(modifier) != 3:
+        raise ValueError("Modifier must be ('SIDE', enable_mask, value_mask)")
+
+    mod_ucode = modifier[0]
+
+    if mod_ucode == "SIDE":
+        gpio_enables = modifier[1]
+        gpio_values = modifier[2]
+
+        _int("SIDE enable mask", gpio_enables)
+        _int("SIDE value mask", gpio_values)
+        apply_side_set(cpu, gpio_enables, gpio_values)
+    else:
+        raise ValueError(f"Unknown instruction modifier: {mod_ucode}")
+
+# ISA 
+
+def set_gpio(cpu: CPU, pin: int, value: int, modifier: Optional[tuple] = None) -> None:
     _check_pin(pin)
     _check_level(value)
-
+    apply_modifier(cpu, modifier)
     # Record only actual latch transitions.
     if cpu.gpio_out[pin] != value:
         cpu.gpio_out[pin] = value
@@ -96,101 +125,43 @@ def set_gpio(cpu: CPU, pin: int, value: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-# ============================================================
-# LOAD
-#    LOAD Rd, immediate
-#
-#    Semantics:
-#        R[Rd] <- immediate
-#
-#    Timing:
-#        1 cycle
-#
-#   PC:
-#        PC <- PC + 1
-# ============================================================
-
-def load_data(cpu: CPU, register: int, value: int) -> None:
+def load_data(cpu: CPU, register: int, value: int, modifier: Optional[tuple] = None) -> None:
     _check_reg(register)
     _int("LOAD immediate", value)
+    apply_modifier(cpu, modifier)
 
     cpu.reg[register] = value & REG_MASK
     cpu.pc += 1
     cpu.cycle += 1
 
-# ============================================================
-# WAIT
-#    WAIT N
-#
-#    Semantics:
-#        cycle <- cycle + N
-#
-#    Timing:
-#        N cycles
-#
-#    PC:
-#        PC <- PC + 1
-# ============================================================
-
-def cpu_wait(cpu: CPU, cycles: int) -> None:
+def cpu_wait(cpu: CPU, cycles: int, modifier: Optional[tuple] = None) -> None:
     _int("WAIT cycles", cycles)
+    apply_modifier(cpu, modifier)
     if cycles < 0:
         raise ValueError("WAIT value cannot be negative")
 
     cpu.cycle += cycles
     cpu.pc += 1
 
-# ============================================================
-# JUMP
-#    JUMP offset
-#
-#    Semantics:
-#        PC <- PC + offset
-#
-#    Timing:
-#        1 cycle
-# ============================================================
-
-def jump_offset(cpu: CPU, offset: int) -> None:
+def jump_offset(cpu: CPU, offset: int, modifier: Optional[tuple] = None) -> None:
     _int("JUMP offset", offset)
+    apply_modifier(cpu, modifier)
     cpu.pc += offset
     cpu.cycle += 1
 
-# ============================================================
-# HALT
-#    HALT
-#
-#    Semantics:
-#        halted <- True
-#
-#    Timing:
-#        1 cycle
-# ============================================================
-
 def cpu_halt(cpu: CPU) -> None:
+    apply_modifier(cpu, modifier)
     cpu.halted = True
     cpu.cycle += 1
 
-# ============================================================
-# IN
-#    IN DIRECTION REGISTER PIN
-#
-#    Semantics:
-#        R: REG <- (REG >> 1) | (GPIO[pin] << 31)   (LSB-first receive)
-#        L: REG <- (REG << 1) | GPIO[pin]           (MSB-first receive)
-#
-#    Timing:
-#        1 cycle
-# ============================================================
-
-def register_in(cpu: CPU, direction: str, register: int, pin: int) -> None:
+def register_in(cpu: CPU, direction: str, register: int, pin: int, modifier: Optional[tuple] = None) -> None:
 
     if direction not in ("L", "R"):
         raise ValueError("IN direction must be L or R")
 
     _check_reg(register)
     _check_pin(pin)
-
+    apply_modifier(cpu, modifier)
     bit = cpu.gpio[pin]
 
     if bit not in (0, 1):
@@ -207,24 +178,13 @@ def register_in(cpu: CPU, direction: str, register: int, pin: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-# ============================================================
-# SHIFT
-#    SHIFT R/L REGISTER VALUE
-#
-#    Semantics:
-#        LEFT/RIGHT shift the bits of a register
-#
-#    Timing:
-#        1 cycle
-# ============================================================
-
-def shift_reg(cpu: CPU, direction: str, register: int, value: int):
+def shift_reg(cpu: CPU, direction: str, register: int, value: int, modifier: Optional[tuple] = None):
     if direction not in ("R", "L"):
         raise ValueError("Invalid shift direction")
 
     _check_reg(register)
     _int("Shift amount", value)
-
+    apply_modifier(cpu, modifier)
     if not 0 <= value < REG_WIDTH:
         raise ValueError(f"Shift amount must be between 0 and {REG_WIDTH - 1}")
 
@@ -237,30 +197,11 @@ def shift_reg(cpu: CPU, direction: str, register: int, value: int):
     cpu.pc += 1
     cpu.cycle += 1
 
-# ============================================================
-# WAIT_PIN
-#    WAIT_PIN PIN VALUE [MODE] [TIMEOUT]
-#
-#    Semantics:
-#        LEVEL: wait until GPIO[pin] == VALUE
-#        FALL : wait for a 1 -> 0 transition (VALUE must be 0)
-#        RISE : wait for a 0 -> 1 transition (VALUE must be 1)
-#        CHECK: sample once; error if GPIO[pin] != VALUE
-#               (used e.g. for UART stop-bit validation)
-#
-#        Each sample costs one cycle. PC advances when matched.
-#        Edges are detected against the level seen in the previous
-#        cycle, so an edge on the first sampled cycle is caught.
-#
-#    Timing:
-#        1 cycle per sample
-# ============================================================
-
-def wait_pin(cpu: CPU,  pin: int, value: int, mode: str = "LEVEL", timeout: Optional[int] = None ) -> None:
+def wait_pin(cpu: CPU,  pin: int, value: int, mode: str = "LEVEL", timeout: Optional[int] = None, modifier: Optional[tuple] = None ) -> None:
 
     _check_pin(pin)
     _check_level(value)
-
+    apply_modifier(cpu, modifier)
     if mode not in ("LEVEL", "FALL", "RISE", "CHECK"):
         raise ValueError("Invalid WAIT_PIN mode")
 
@@ -336,24 +277,10 @@ def wait_pin(cpu: CPU,  pin: int, value: int, mode: str = "LEVEL", timeout: Opti
         cpu.wait_pin_state = None
         raise TimeoutError(f"WAIT_PIN timed out on GPIO{pin}")
 
-# ============================================================
-#    DIR pin, direction
-#
-#    direction:
-#        0 = INPUT   (pin released; level comes from the wire)
-#        1 = OUTPUT  (pin driven from the output latch)
-#
-#    Timing:
-#        1 cycle
-#
-#    PC:
-#        PC <- PC + 1
-# ============================================================
-
-def set_gpio_dir(cpu: CPU, pin: int, direction: int):
+def set_gpio_dir(cpu: CPU, pin: int, direction: int, modifier: Optional[tuple] = None):
     _check_pin(pin)
     _int("Direction", direction)
-
+    apply_modifier(cpu, modifier)
     if direction not in (GPIO_INPUT, GPIO_OUTPUT):
         raise ValueError("Direction must be 0 or 1")
 
@@ -364,26 +291,14 @@ def set_gpio_dir(cpu: CPU, pin: int, direction: int):
     cpu.pc += 1
     cpu.cycle += 1
 
-# ============================================================
-# OUT
-#    OUT DIRECTION PIN REGISTER
-#
-#    Semantics:
-#        R: REG <- (REG >> 1) | (GPIO[pin] << 31)   (LSB-first receive)
-#        L: REG <- (REG << 1) | GPIO[pin]           (MSB-first receive)
-#
-#    Timing:
-#        1 cycle
-# ============================================================
-
-def register_out(cpu: CPU, direction: str, register: int, pin: int) -> None:
-
+def register_out(cpu: CPU, direction: str, register: int, pin: int, modifier: Optional[tuple] = None) -> None:
+    
     if direction not in ("L", "R"):
         raise ValueError("OUT direction must be L or R")
 
     _check_reg(register)
     _check_pin(pin)
-
+    apply_modifier(cpu, modifier)
     if direction == "R":
         # LSB-first:
         # output bit 0, then shift register right
@@ -407,20 +322,20 @@ def register_out(cpu: CPU, direction: str, register: int, pin: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-def move_register(cpu: CPU, dst_register: int, src_register: int) -> None:
+def move_register(cpu: CPU, dst_register: int, src_register: int, modifier: Optional[tuple] = None) -> None:
 
     _check_reg(dst_register)
     _check_reg(src_register)
-
+    apply_modifier(cpu, modifier)
     cpu.reg[dst_register] = cpu.reg[src_register] & REG_MASK
 
     cpu.pc += 1
     cpu.cycle += 1
 
-def load_timer(cpu: CPU, timer: int, value: int) -> None:
+def load_timer(cpu: CPU, timer: int, value: int, modifier: Optional[tuple] = None) -> None:
     _check_timer(timer)
     _int("Timer value", value)
-
+    apply_modifier(cpu, modifier)
     if value < 0:
         raise ValueError("Timer value cannot be negative")
 
@@ -429,38 +344,13 @@ def load_timer(cpu: CPU, timer: int, value: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-def wait_timer(cpu: CPU, timer: int) -> None:
+def wait_timer(cpu: CPU, timer: int, modifier: Optional[tuple] = None) -> None:
     _check_timer(timer)
-
+    apply_modifier(cpu, modifier)
     cpu.cycle += cpu.timer[timer]
     cpu.pc += 1
 
-# ============================================================
-# OUT_W
-#    OUT_W DIRECTION REGISTER PIN COUNT TIMER
-#
-# Semantics:
-#    R:
-#       GPIO <- REG[0]
-#       REG  <- REG >> 1
-#
-#    L:
-#       GPIO <- REG[31]
-#       REG  <- REG << 1
-#
-#    Repeated COUNT times.
-#    After every transmitted bit, wait TIMER cycles.
-#
-# Timing:
-#    COUNT * (1 + TIMER_VALUE) cycles
-#
-# Example:
-#    ("OUT_W", "R", 0, 0, 8, 0)
-#
-#    Send 8 LSB-first bits from R0 onto GPIO0,
-#    using T0 as the inter-bit delay.
-# ============================================================
-def register_out_window(cpu: CPU, direction: str, register: int, pin: int,  count_register: int, timer: int) -> None:
+def register_out_window(cpu: CPU, direction: str, register: int, pin: int,  count_register: int, timer: int, modifier: Optional[tuple] = None) -> None:
 
     if direction not in ("L", "R"):
         raise ValueError("OUT_W direction must be L or R")
@@ -469,7 +359,7 @@ def register_out_window(cpu: CPU, direction: str, register: int, pin: int,  coun
     _check_pin(pin)
     _check_reg(count_register)
     _check_timer(timer)
-
+    apply_modifier(cpu, modifier)
     key = (
         cpu.pc,
         "OUT_W",
@@ -535,31 +425,7 @@ def register_out_window(cpu: CPU, direction: str, register: int, pin: int,  coun
         cpu.pc += 1
         cpu.window_state = None
 
-# ============================================================
-# IN_W
-#    IN_W DIRECTION REGISTER PIN COUNT TIMER
-#
-# Semantics:
-#    R:
-#       REG <- (REG >> 1) | (GPIO << 31)
-#
-#    L:
-#       REG <- (REG << 1) | GPIO
-#
-#    Repeated COUNT times.
-#    After every sampled bit, wait TIMER cycles.
-#
-# Timing:
-#    COUNT * (1 + TIMER_VALUE) cycles
-#
-# Example:
-#    ("IN_W", "R", 0, 3, 8, 0)
-#
-#    Receive 8 LSB-first bits from GPIO3 into R0,
-#    using T0 as the inter-bit delay.
-# ============================================================
-
-def register_in_window(cpu: CPU, direction: str, register: int, pin: int, count_register: int, timer: int) -> None:
+def register_in_window(cpu: CPU, direction: str, register: int, pin: int, count_register: int, timer: int, modifier: Optional[tuple] = None) -> None:
 
     if direction not in ("L", "R"):
         raise ValueError("IN_W direction must be L or R")
@@ -568,7 +434,7 @@ def register_in_window(cpu: CPU, direction: str, register: int, pin: int, count_
     _check_pin(pin)
     _check_reg(count_register)
     _check_timer(timer)
-
+    apply_modifier(cpu, modifier)
     key = (
         cpu.pc,
         "IN_W",
@@ -627,11 +493,11 @@ def register_in_window(cpu: CPU, direction: str, register: int, pin: int, count_
         cpu.pc += 1
         cpu.window_state = None
 
-def compare_registers(cpu: CPU, reg_a: int, reg_b: int) -> None:
+def compare_registers(cpu: CPU, reg_a: int, reg_b: int, modifier: Optional[tuple] = None) -> None:
 
     _check_reg(reg_a)
     _check_reg(reg_b)
-
+    apply_modifier(cpu, modifier)
     a = cpu.reg[reg_a] & REG_MASK
     b = cpu.reg[reg_b] & REG_MASK
 
@@ -672,10 +538,10 @@ def compare_registers(cpu: CPU, reg_a: int, reg_b: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-def compare_immediate( cpu: CPU, register: int, immediate: int) -> None:
+def compare_immediate( cpu: CPU, register: int, immediate: int, modifier: Optional[tuple] = None) -> None:
     _check_reg(register)
     _int("CMP immediate", immediate)
-
+    apply_modifier(cpu, modifier)
     a = cpu.reg[register] & REG_MASK
     b = immediate & REG_MASK
 
@@ -699,10 +565,10 @@ def compare_immediate( cpu: CPU, register: int, immediate: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-def conditional_jump(cpu: CPU, condition: str, offset: int) -> None:
+def conditional_jump(cpu: CPU, condition: str, offset: int, modifier: Optional[tuple] = None) -> None:
 
     _int("JCC offset", offset)
-
+    apply_modifier(cpu, modifier)
     z = bool(cpu.flags & FLAG_Z)
     n = bool(cpu.flags & FLAG_N)
     c = bool(cpu.flags & FLAG_C)
@@ -748,28 +614,10 @@ def conditional_jump(cpu: CPU, condition: str, offset: int) -> None:
 
     cpu.cycle += 1
 
-# def loop_register(cpu: CPU, register: int, offset: int) -> None:
-#     _check_reg(register)
-#     _int("LOOP offset", offset)
-
-#     if cpu.reg[register] == 0:
-#         cpu.pc += 1
-#         cpu.cycle += 1
-#         return
-
-#     cpu.reg[register] -= 1
-
-#     if cpu.reg[register] != 0:
-#         cpu.pc += offset
-#     else:
-#         cpu.pc += 1
-
-#     cpu.cycle += 1
-
-def add_register(cpu: CPU, dst: int, src: int) -> None:
+def add_register(cpu: CPU, dst: int, src: int, modifier: Optional[tuple] = None ) -> None:
     _check_reg(dst)
     _check_reg(src)
-
+    apply_modifier(cpu, modifier)
     a = cpu.reg[dst] & REG_MASK
     b = cpu.reg[src] & REG_MASK
     result = a + b
@@ -780,10 +628,10 @@ def add_register(cpu: CPU, dst: int, src: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-def add_immediate(cpu: CPU, dst: int, immediate: int) -> None:
+def add_immediate(cpu: CPU, dst: int, immediate: int, modifier: Optional[tuple] = None) -> None:
     _check_reg(dst)
     _int("ADDI immediate", immediate)
-
+    apply_modifier(cpu, modifier)
     a = cpu.reg[dst] & REG_MASK
     b = immediate & REG_MASK
     result = a + b
@@ -794,10 +642,10 @@ def add_immediate(cpu: CPU, dst: int, immediate: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-def sub_register(cpu: CPU, dst: int, src: int) -> None:
+def sub_register(cpu: CPU, dst: int, src: int, modifier: Optional[tuple] = None) -> None:
     _check_reg(dst)
     _check_reg(src)
-
+    apply_modifier(cpu, modifier)
     a = cpu.reg[dst] & REG_MASK
     b = cpu.reg[src] & REG_MASK
     result = a - b
@@ -808,10 +656,10 @@ def sub_register(cpu: CPU, dst: int, src: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-def sub_immediate(cpu: CPU, dst: int, immediate: int) -> None:
+def sub_immediate(cpu: CPU, dst: int, immediate: int, modifier: Optional[tuple] = None) -> None:
     _check_reg(dst)
     _int("SUBI immediate", immediate)
-
+    apply_modifier(cpu, modifier)
     a = cpu.reg[dst] & REG_MASK
     b = immediate & REG_MASK
     result = a - b
@@ -822,9 +670,9 @@ def sub_immediate(cpu: CPU, dst: int, immediate: int) -> None:
     cpu.pc += 1
     cpu.cycle += 1
 
-def clock_edge(cpu: CPU, pin: int, edge: str) -> None:
+def clock_edge(cpu: CPU, pin: int, edge: str, modifier: Optional[tuple] = None) -> None:
     _check_pin(pin)
-
+    apply_modifier(cpu, modifier)
     if edge not in ("LEAD", "TRAIL"):
         raise ValueError("CLK edge must be LEAD or TRAIL")
 
