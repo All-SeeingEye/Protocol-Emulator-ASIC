@@ -17,10 +17,68 @@ from typing import Optional
 
 from cpu import CPU, GPIO_COUNT, REG_COUNT, REG_MASK, GPIO_OUTPUT
 from simulator import execute, check_syntax, split_modifier
-from isa import apply_modifier
+from isa import apply_modifier, get_delay 
 
 READ_KEYS = ('program', 'external_events', 'initial_gpio', 'initial_gpio_dir', 'initial_regs')
 
+
+def eval_constant(node, constants):
+    if isinstance(node, ast.Constant):
+        return node.value
+
+    if isinstance(node, ast.Name):
+        if node.id not in constants:
+            raise ValueError(f"Unknown constant: {node.id}")
+        return constants[node.id]
+
+    if isinstance(node, ast.Tuple):
+        return tuple(eval_constant(item, constants) for item in node.elts)
+
+    if isinstance(node, ast.List):
+        return [eval_constant(item, constants) for item in node.elts]
+
+    if isinstance(node, ast.BinOp):
+        left = eval_constant(node.left, constants)
+        right = eval_constant(node.right, constants)
+
+        if isinstance(node.op, ast.LShift):
+            return left << right
+
+        if isinstance(node.op, ast.RShift):
+            return left >> right
+
+        if isinstance(node.op, ast.BitOr):
+            return left | right
+
+        if isinstance(node.op, ast.BitAnd):
+            return left & right
+
+        if isinstance(node.op, ast.BitXor):
+            return left ^ right
+
+        if isinstance(node.op, ast.Add):
+            return left + right
+
+        if isinstance(node.op, ast.Sub):
+            return left - right
+
+        raise ValueError(f"Unsupported constant operator: {type(node.op).__name__}")
+
+    if isinstance(node, ast.UnaryOp):
+        value = eval_constant(node.operand, constants)
+
+        if isinstance(node.op, ast.USub):
+            return -value
+
+        if isinstance(node.op, ast.UAdd):
+            return value
+
+        if isinstance(node.op, ast.Invert):
+            return ~value
+
+        raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
+
+    raise ValueError(f"Unsupported constant expression: {ast.dump(node)}")
 
 # ============================================================
 # Parsing (uploaded Python is never executed)
@@ -34,20 +92,34 @@ def parse_program(source: str):
         raise ValueError(f'Python syntax error on line {exc.lineno}: {exc.msg}') from None
 
     assignments = {}
+    constants = {}
+
     for node in tree.body:
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            if node.value is None:          # bare annotation: `program: list`
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+
+        if node.value is None:
+            continue
+
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+
+        for target in targets:
+            if not isinstance(target, ast.Name):
                 continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if isinstance(target, ast.Name) and target.id in READ_KEYS:
-                    try:
-                        assignments[target.id] = ast.literal_eval(node.value)
-                    except ValueError:
-                        raise ValueError(
-                            f'`{target.id}` (line {node.lineno}) must be a literal: only numbers, '
-                            'strings, tuples and lists are allowed (no variables, loops or calls).'
-                        ) from None
+
+            name = target.id
+
+            try:
+                value = eval_constant(node.value, constants)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid expression for `{name}` on line {node.lineno}: {exc}"
+                ) from None
+
+            if name in READ_KEYS:
+                assignments[name] = value
+            else:
+                constants[name] = value
 
     if 'program' not in assignments:
         raise ValueError('Define program = [("DIR", 0, 1), ...] in the uploaded .py file.')
@@ -112,6 +184,11 @@ class Core:
         self.wait_modifier_applied = False
         self.rows = []
 
+        # for delat instructions
+        self.delay_left = 0
+        self.delay_pc = None
+        self.delay_instruction = None
+
         cpu = CPU()
         gpio = _check_initial(f'{name} initial_gpio', initial_gpio, GPIO_COUNT, (0, 1))
         gdir = _check_initial(f'{name} initial_gpio_dir', initial_gpio_dir, GPIO_COUNT, (0, 1))
@@ -126,11 +203,22 @@ class Core:
         self.initial_gpio = list(cpu.gpio)
         self.cpu = cpu
 
-        
-
     def step(self):
         """Execute exactly one cycle. Returns (pc, instruction) that used it."""
         cpu, program = self.cpu, self.program
+        # Existing instruction is in its DELAY hold cycles.
+        if self.delay_left > 0:
+            pc = self.delay_pc
+            ins = self.delay_instruction
+
+            cpu.cycle += 1
+            self.delay_left -= 1
+
+            if self.delay_left == 0:
+                self.delay_pc = None
+                self.delay_instruction = None
+
+            return pc, ins
 
         if self.wait_left == 0:
             while True:
@@ -146,11 +234,6 @@ class Core:
 
                     if type(core_ins[1]) is not int or core_ins[1] < 0:
                         raise ValueError('WAIT expects a nonnegative integer cycle count')
-
-                    if wait_cycles == 0:
-                        if modifier is not None:
-                            raise ValueError("SIDE cannot be attached to a zero-cycle WAIT")
-                        continue
 
                     wait_cycles = core_ins[1]
 
@@ -170,16 +253,17 @@ class Core:
                 else:
                     break
 
-                if modifier is not None:
-                    apply_modifier(cpu, modifier)
-
                 if wait_cycles == 0:
+                    if modifier is not None:
+                        raise ValueError("Modifier cannot be attached to a zero-cycle WAIT")
                     cpu.pc += 1
                     continue
 
+                if modifier is not None:
+                    apply_modifier(cpu, modifier)
+
                 self.wait_left = wait_cycles
                 break
-
         pc, ins = cpu.pc, program[cpu.pc]
         start = cpu.cycle
 
@@ -191,7 +275,13 @@ class Core:
                 cpu.pc += 1
 
         else:
+            core_ins, modifier = split_modifier(ins)
             execute(cpu, ins)
+            delay = get_delay(modifier)
+            if delay > 0:
+                self.delay_left = delay
+                self.delay_pc = pc
+                self.delay_instruction = ins
 
         if cpu.cycle != start + 1:
             raise RuntimeError(

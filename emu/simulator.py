@@ -1,4 +1,5 @@
 from isa import *
+from isa import _int
 from cpu import *
 from dataclasses import dataclass, field
 # Operand count for each opcode (including the opcode itself).
@@ -26,28 +27,35 @@ SYNTAX = {
     "ADDI":     ((3, 3), "('ADDI', dst_register, immediate)"),
     "SUB":      ((3, 3), "('SUB', dst_register, src_register)"),
     "SUBI":     ((3, 3), "('SUBI', dst_register, immediate)"),
+    "NOP":      ((1,1), "('NOP',)"),
 }
 
-def split_modifier(instruction: tuple) -> tuple[tuple, Optional[tuple]]:
-    if not instruction:
-        raise ValueError("Empty instruction")
+def split_modifier(instruction: tuple) -> tuple[tuple, tuple | None]:
+    if not isinstance(instruction, tuple) or not instruction:
+        raise ValueError("Instruction must be a non-empty tuple")
 
+    last = instruction[-1]
     modifier = None
 
-    if isinstance(instruction[-1], tuple):
-        candidate = instruction[-1]
+    if isinstance(last, tuple):
+        # Single modifier
+        if last and isinstance(last[0], str) and last[0] in ("SIDE", "DELAY", "ATOMIC"):
+            modifier = last
+            instruction = instruction[:-1]
 
-        if candidate and candidate[0] == "SIDE":
-            if len(candidate) != 3:
-                raise ValueError("SIDE modifier syntax: ('SIDE', enable_mask, value_mask)")
-
-            modifier = candidate
+        # Multiple modifiers
+        elif last and all(isinstance(mod, tuple) and mod for mod in last):
+            modifier = last
             instruction = instruction[:-1]
 
     return instruction, modifier
 
 def check_syntax(instruction: tuple) -> None:
     core, modifier = split_modifier(instruction)
+
+    if not core:
+        raise ValueError("Instruction contains only a modifier")
+
     opcode = core[0]
 
     if opcode not in SYNTAX:
@@ -56,11 +64,65 @@ def check_syntax(instruction: tuple) -> None:
     (lo, hi), usage = SYNTAX[opcode]
 
     if not lo <= len(core) <= hi:
-        raise ValueError(f"{opcode} syntax: {usage} + optional ('SIDE', enable_mask, value_mask)")
+        raise ValueError(f"{opcode} syntax: {usage}")
 
     if modifier is not None:
-        _int("SIDE enable mask", modifier[1])
-        _int("SIDE value mask", modifier[2])
+        modifiers = normalize_modifiers(modifier)
+
+        seen_side = False
+        seen_delay = False
+        seen_atomic = False
+
+        for mod in modifiers:
+            mod_opcode = mod[0]
+
+            if mod_opcode == "SIDE":
+                if seen_side:
+                    raise ValueError("Only one SIDE modifier is allowed per instruction")
+
+                if len(mod) != 3:
+                    raise ValueError("SIDE modifier must be ('SIDE', enable_mask, value_mask)")
+
+                enable_mask = mod[1]
+                value_mask = mod[2]
+
+                _int("SIDE enable mask", enable_mask)
+                _int("SIDE value mask", value_mask)
+
+                if not 0 <= enable_mask < (1 << GPIO_COUNT):
+                    raise ValueError(f"SIDE enable mask must fit within {GPIO_COUNT} GPIO bits")
+
+                if not 0 <= value_mask < (1 << GPIO_COUNT):
+                    raise ValueError(f"SIDE value mask must fit within {GPIO_COUNT} GPIO bits")
+
+                seen_side = True
+
+            elif mod_opcode == "DELAY":
+                if seen_delay:
+                    raise ValueError("Only one DELAY modifier is allowed per instruction")
+
+                if len(mod) != 2:
+                    raise ValueError("DELAY modifier must be ('DELAY', cycles)")
+
+                cycles = mod[1]
+                _int("DELAY cycles", cycles)
+
+                if cycles < 0:
+                    raise ValueError("DELAY cycles cannot be negative")
+
+                seen_delay = True
+
+            elif mod_opcode == "ATOMIC":
+                if seen_atomic:
+                    raise ValueError("Only one ATOMIC modifier allowed")
+                if opcode != "WAIT_PIN":
+                    raise ValueError("ATOMIC is initially supported only on WAIT_PIN")
+                if len(mod) != 2:
+                    raise ValueError("ATOMIC syntax: ('ATOMIC', (actions...))")
+                validate_atomic(mod[1])
+                seen_atomic = True
+            else:
+                raise ValueError(f"Unknown instruction modifier: {mod_opcode}")
 
 def execute(cpu: CPU, instruction: tuple) -> None:
     """Decode one instruction. Each ISA function updates PC and cycle itself."""
@@ -76,7 +138,7 @@ def execute(cpu: CPU, instruction: tuple) -> None:
     elif opcode == "JUMP":
         jump_offset(cpu, core[1], modifier)
     elif opcode == "HALT":
-        cpu_halt(cpu)
+        cpu_halt(cpu, modifier)
     elif opcode == "IN":
         register_in(cpu, core[1], core[2], core[3], modifier)
     elif opcode == "OUT":
@@ -105,8 +167,6 @@ def execute(cpu: CPU, instruction: tuple) -> None:
         compare_immediate(cpu, core[1], core[2], modifier)
     elif opcode == "JCC":
         conditional_jump(cpu, core[1], core[2], modifier)
-    # elif opcode == "LOOP":
-    #     loop_register(cpu, core[1], core[2])
     elif opcode == "ADD":
         add_register(cpu, core[1], core[2], modifier)
     elif opcode == "ADDI":
@@ -115,8 +175,8 @@ def execute(cpu: CPU, instruction: tuple) -> None:
         sub_register(cpu, core[1], core[2], modifier)
     elif opcode == "SUBI":
         sub_immediate(cpu, core[1], core[2], modifier)
-    elif opcode == "CLK":
-        clock_edge(cpu, core[1], core[2], modifier)
+    elif opcode == "NOP":
+        nop(cpu, modifier)
 
 # Only for testing purpose of WAIT_PIN
 def update_external_gpio(cpu: CPU):

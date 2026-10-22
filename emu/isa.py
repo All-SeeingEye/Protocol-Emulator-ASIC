@@ -90,23 +90,182 @@ def apply_side_set(cpu: CPU, enable_mask: int, value_mask: int) -> None:
                 cpu.gpio[pin] = value
 
 def apply_modifier(cpu: CPU, modifier: Optional[tuple]) -> None:
+    modifiers = normalize_modifiers(modifier)
+
+    seen_side = False
+    seen_delay = False
+
+    for mod in modifiers:
+        mod_ucode = mod[0]
+
+        if mod_ucode == "SIDE":
+            if seen_side:
+                raise ValueError("Only one SIDE modifier is allowed per instruction")
+            if len(mod) != 3:
+                raise ValueError("SIDE modifier must be ('SIDE', enable_mask, value_mask)")
+
+            gpio_enables = mod[1]
+            gpio_values = mod[2]
+
+            _int("SIDE enable mask", gpio_enables)
+            _int("SIDE value mask", gpio_values)
+
+            if not 0 <= gpio_enables < (1 << GPIO_COUNT):
+                raise ValueError(f"SIDE enable mask must fit within {GPIO_COUNT} GPIO bits")
+
+            if not 0 <= gpio_values < (1 << GPIO_COUNT):
+                raise ValueError(f"SIDE value mask must fit within {GPIO_COUNT} GPIO bits")
+
+            apply_side_set(cpu, gpio_enables, gpio_values)
+            seen_side = True
+
+        elif mod_ucode == "ATOMIC":
+            if len(mod) != 2:
+                raise ValueError("ATOMIC modifier must be ('ATOMIC', actions)")
+            apply_atomic(cpu, mod[1])
+
+        elif mod_ucode == "DELAY":
+            if seen_delay:
+                raise ValueError("Only one DELAY modifier is allowed per instruction")
+            if len(mod) != 2:
+                raise ValueError("DELAY modifier must be ('DELAY', cycles)")
+
+            cycles = mod[1]
+            _int("DELAY cycles", cycles)
+
+            if cycles < 0:
+                raise ValueError("DELAY cycles cannot be negative")
+
+            # Do not advance cpu.cycle here.
+            # engine.py handles the extra delay cycles.
+            seen_delay = True
+
+        else:
+            raise ValueError(f"Unknown instruction modifier: {mod_ucode}")
+
+def normalize_modifiers(modifier: Optional[tuple]) -> tuple:
     if modifier is None:
-        return
+        return ()
 
-    if len(modifier) != 3:
-        raise ValueError("Modifier must be ('SIDE', enable_mask, value_mask)")
+    if not isinstance(modifier, tuple) or not modifier:
+        raise ValueError("Modifier must be a non-empty tuple")
 
-    mod_ucode = modifier[0]
+    # Single modifier:
+    # ("SIDE", enable_mask, value_mask)
+    # ("DELAY", cycles)
+    if isinstance(modifier[0], str):
+        return (modifier,)
 
-    if mod_ucode == "SIDE":
-        gpio_enables = modifier[1]
-        gpio_values = modifier[2]
+    # Multiple modifiers:
+    # (
+    #     ("SIDE", enable_mask, value_mask),
+    #     ("DELAY", cycles)
+    # )
+    for mod in modifier:
+        if not isinstance(mod, tuple) or not mod:
+            raise ValueError("Each modifier must be a non-empty tuple")
 
-        _int("SIDE enable mask", gpio_enables)
-        _int("SIDE value mask", gpio_values)
-        apply_side_set(cpu, gpio_enables, gpio_values)
-    else:
-        raise ValueError(f"Unknown instruction modifier: {mod_ucode}")
+    return modifier
+
+def validate_atomic(actions) -> None:
+    """Validate a bounded set of independent single-cycle hardware-like operations."""
+    if not isinstance(actions, (tuple, list)) or not 1 <= len(actions) <= 4:
+        raise ValueError("ATOMIC requires 1-4 action tuples")
+    destinations = set()
+    flag_writers = 0
+    for act in actions:
+        if not isinstance(act, tuple) or not act:
+            raise ValueError("Invalid ATOMIC action")
+        op = act[0]
+        if op in ("IN", "OUT"):
+            if len(act) != 4 or act[1] not in ("L", "R"):
+                raise ValueError(f"Invalid {op} action")
+            _check_reg(act[2]); _check_pin(act[3])
+            writes = [("reg", act[2])]
+            if op == "OUT":
+                writes.append(("pin", act[3]))
+        elif op == "SUBI":
+            if len(act) != 3:
+                raise ValueError("Invalid SUBI action")
+            _check_reg(act[1]); _int("SUBI immediate", act[2])
+            writes = [("reg", act[1]), ("flags", 0)]
+            flag_writers += 1
+        elif op == "SET":
+            if len(act) != 3:
+                raise ValueError("Invalid SET action")
+            _check_pin(act[1]); _check_level(act[2])
+            writes = [("pin", act[1])]
+        else:
+            raise ValueError(f"Unsupported ATOMIC action: {op}")
+        for dest in writes:
+            if dest in destinations:
+                raise ValueError(f"ATOMIC write conflict: {dest}")
+            destinations.add(dest)
+
+
+def apply_atomic(cpu: CPU, actions) -> None:
+    """All actions read pre-event state, then commit once with no extra PC/cycle cost."""
+    validate_atomic(actions)
+    reg_old = list(cpu.reg)
+    pin_old = list(cpu.gpio)
+    reg_updates, pin_updates = {}, {}
+    flag_update = None
+    for act in actions:
+        op = act[0]
+        if op == "IN":
+            _, direction, reg, pin = act
+            bit = pin_old[pin]
+            if bit not in (0, 1):
+                raise ValueError("Invalid sampled GPIO level")
+            reg_updates[reg] = (((reg_old[reg] << 1) | bit) if direction == "L" else ((reg_old[reg] >> 1) | (bit << (REG_WIDTH - 1)))) & REG_MASK
+        elif op == "OUT":
+            _, direction, reg, pin = act
+            pin_updates[pin] = ((reg_old[reg] >> (REG_WIDTH - 1)) & 1) if direction == "L" else (reg_old[reg] & 1)
+            reg_updates[reg] = ((reg_old[reg] << 1) & REG_MASK) if direction == "L" else (reg_old[reg] >> 1)
+        elif op == "SUBI":
+            _, reg, imm = act
+            a, b = reg_old[reg] & REG_MASK, imm & REG_MASK
+            result = a - b
+            reg_updates[reg] = result & REG_MASK
+            # Use existing arithmetic helper, but on the real flags only at commit.
+            flag_update = (a, b, result)
+        elif op == "SET":
+            pin_updates[act[1]] = act[2]
+    for reg, value in reg_updates.items():
+        cpu.reg[reg] = value
+    for pin, value in pin_updates.items():
+        if cpu.gpio_out[pin] != value:
+            cpu.gpio_out[pin] = value
+            cpu.waveform.append((cpu.cycle, pin, value))
+        if cpu.gpio_dir[pin] == GPIO_OUTPUT:
+            cpu.gpio[pin] = value
+    if flag_update is not None:
+        _set_sub_flags(cpu, *flag_update)
+
+
+def get_delay(modifier: Optional[tuple]) -> int:
+    modifiers = normalize_modifiers(modifier)
+
+    delay = 0
+    seen_delay = False
+
+    for mod in modifiers:
+        if mod[0] == "DELAY":
+            if seen_delay:
+                raise ValueError("Only one DELAY modifier is allowed per instruction")
+
+            if len(mod) != 2:
+                raise ValueError("DELAY modifier must be ('DELAY', cycles)")
+
+            delay = mod[1]
+            _int("DELAY cycles", delay)
+
+            if delay < 0:
+                raise ValueError("DELAY cycles cannot be negative")
+
+            seen_delay = True
+
+    return delay
 
 # ISA 
 
@@ -149,7 +308,7 @@ def jump_offset(cpu: CPU, offset: int, modifier: Optional[tuple] = None) -> None
     cpu.pc += offset
     cpu.cycle += 1
 
-def cpu_halt(cpu: CPU) -> None:
+def cpu_halt(cpu: CPU, modifier: Optional[tuple] = None) -> None:
     apply_modifier(cpu, modifier)
     cpu.halted = True
     cpu.cycle += 1
@@ -197,11 +356,10 @@ def shift_reg(cpu: CPU, direction: str, register: int, value: int, modifier: Opt
     cpu.pc += 1
     cpu.cycle += 1
 
-def wait_pin(cpu: CPU,  pin: int, value: int, mode: str = "LEVEL", timeout: Optional[int] = None, modifier: Optional[tuple] = None ) -> None:
-
+def wait_pin(cpu: CPU, pin: int, value: int, mode: str = "LEVEL", timeout: Optional[int] = None, modifier: Optional[tuple] = None) -> None:
     _check_pin(pin)
     _check_level(value)
-    apply_modifier(cpu, modifier)
+
     if mode not in ("LEVEL", "FALL", "RISE", "CHECK"):
         raise ValueError("Invalid WAIT_PIN mode")
 
@@ -217,32 +375,36 @@ def wait_pin(cpu: CPU,  pin: int, value: int, mode: str = "LEVEL", timeout: Opti
             raise ValueError("Timeout must be positive")
 
     current = cpu.gpio[pin]
-
     if current not in (0, 1):
         raise ValueError("Invalid sampled GPIO level")
 
-    # A one-cycle check, used for UART stop-bit validation.
+    # CHECK samples once. The modifier belongs to the successful check cycle,
+    # so it is applied only after the requested level has been verified.
     if mode == "CHECK":
         cpu.wait_pin_state = None
         cpu.cycle += 1
 
         if current != value:
             raise RuntimeError(f"GPIO{pin}: expected {value}, got {current}")
+
+        apply_modifier(cpu, modifier)
         cpu.pc += 1
         return
 
-    # Identify the current waiting instruction.
+    # Identify this particular waiting instruction.
     key = (cpu.pc, pin, value, mode)
 
     # Initialize state on the first sampling attempt.
-    if (cpu.wait_pin_state is None or cpu.wait_pin_state["key"] != key):
+    if cpu.wait_pin_state is None or cpu.wait_pin_state["key"] != key:
         if cpu.gpio_prev is not None:
-            # Engine tracks the previous-cycle level: edge detection is live
-            # from the very first sample, like a hardware edge detector.
+            # The engine provides the previous-cycle GPIO level, so an edge
+            # may be detected immediately on the first cycle of WAIT_PIN.
             previous, armed = cpu.gpio_prev[pin], True
         else:
-            # Standalone use: first sample only arms the detector.
+            # Standalone execution has no previous-cycle snapshot. The first
+            # sample therefore arms the edge detector.
             previous, armed = current, False
+
         cpu.wait_pin_state = {
             "key": key,
             "previous": previous,
@@ -255,20 +417,21 @@ def wait_pin(cpu: CPU,  pin: int, value: int, mode: str = "LEVEL", timeout: Opti
 
     if mode == "LEVEL":
         matched = current == value
-
     elif mode == "FALL":
         matched = state["armed"] and previous == 1 and current == 0
-
     else:  # RISE
         matched = state["armed"] and previous == 0 and current == 1
 
     state["previous"] = current
     state["armed"] = True
     state["elapsed"] += 1
-
     cpu.cycle += 1
 
     if matched:
+        # WAIT_PIN modifiers are event modifiers: they fire exactly once, on
+        # the cycle in which the requested level/edge is observed. They must
+        # not execute while the instruction is merely stalled and waiting.
+        apply_modifier(cpu, modifier)
         cpu.pc += 1
         cpu.wait_pin_state = None
         return
@@ -690,4 +853,10 @@ def clock_edge(cpu: CPU, pin: int, edge: str, modifier: Optional[tuple] = None) 
 
     cpu.pc += 1
     cpu.cycle += 1
+
+def nop(cpu: CPU, modifier: Optional[tuple] = None) -> None:
+    apply_modifier(cpu, modifier)
+    cpu.pc += 1
+    cpu.cycle += 1
+
 
